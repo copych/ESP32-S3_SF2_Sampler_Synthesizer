@@ -7,6 +7,7 @@
 #include <SPI.h>
 #include <functional>
 #include <new> 
+#include <Wire.h>
 
 
 MenuItem::MenuItem() {

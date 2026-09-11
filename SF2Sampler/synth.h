@@ -70,6 +70,14 @@ public:
     bool saveSynthState(const char* path=DEFAULT_CONFIG_FILE);
     const String& getCurrentSf2Path() const { return currentSf2Path; }
 
+    // Asset residency changes run on Core1 while audio renders on Core0.
+    // These form a block-boundary handshake: Core1 never invalidates PCM
+    // until Core0 has acknowledged that it is outside renderLRBlock().
+    void beginAssetUpdate();
+    void endAssetUpdate();
+    bool audioAssetUpdateRequested() const;
+    void setAudioAssetPaused(bool paused);
+
 private:
     
     String currentSf2Path;  // full path of currently loaded SF2 file
@@ -87,4 +95,8 @@ private:
 //    FileSystemType fsType = FileSystemType::LITTLEFS;  // default
     FileSystemType fsType = FileSystemType::SD;  // default
     std::vector<String> sf2Files;
+
+    volatile bool assetUpdateRequested = false;
+    volatile bool audioAssetPaused = false;
+    uint8_t assetUpdateDepth = 0;
 };

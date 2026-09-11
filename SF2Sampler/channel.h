@@ -213,4 +213,6 @@ struct DRAM_ATTR ChannelState {
 #endif
       
     }
+	
+	std::vector<SampleHeader*> loadedSamples;
 };

@@ -24,6 +24,7 @@
 #pragma once
 
 enum class GeneratorOperator : uint16_t {
+ // Invalid                    = 0xFFFF,
     StartAddrOffset            = 0,
     EndAddrOffset              = 1,
     StartLoopAddrOffset        = 2,
@@ -135,11 +136,12 @@ inline const char* toString(GeneratorOperator op) {
         default:                                            return "UnknownOperator";
     }
 }
-// Конвертер числа в enum
+// number to Gen
 inline GeneratorOperator toGeneratorOperator(uint16_t raw) {
     if (raw <= static_cast<uint16_t>(GeneratorOperator::OverridingRootKey)) {
         return static_cast<GeneratorOperator>(raw);
     }
     return GeneratorOperator::StartAddrOffset;
+    //return GeneratorOperator::Invalid;
 }
 

@@ -24,12 +24,67 @@
 
 #include "synth.h"
 #include "config.h"
+#include "dump.h"
 #include <float.h>
 #include <math.h>
 #include <FS.h>
 #include <SD_MMC.h>
 #include <LittleFS.h>
 #include "TLVStorage.h"
+
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+
+static void* g_dma_reserve = nullptr;
+static size_t g_dma_reserve_size = 64 * 1024;
+
+static void dma_reserve_acquire()
+{
+    g_dma_reserve = heap_caps_malloc(g_dma_reserve_size, MALLOC_CAP_DMA);
+
+    if (!g_dma_reserve) {
+        ESP_LOGE("DMA", "reserve FAILED (%u)", (unsigned)g_dma_reserve_size);
+        return;
+    }
+
+    ESP_LOGI("DMA", "reserve ACQUIRED ptr=%p size=%u",
+             g_dma_reserve, (unsigned)g_dma_reserve_size);
+
+    // Optional but recommended: touch memory
+    memset(g_dma_reserve, 1, g_dma_reserve_size);
+}
+
+static void dma_reserve_release()
+{
+    if (g_dma_reserve) {
+        heap_caps_free(g_dma_reserve);
+        ESP_LOGI("DMA", "reserve RELEASED");
+
+        g_dma_reserve = nullptr;
+    }
+}
+
+static void dump_mem_caps(const char* tag)
+{
+    size_t free_8bit   = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t free_dma    = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+    size_t largest_8bit   = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t largest_dma    = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+    size_t largest_spiram = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+
+    ESP_LOGI("MEM",
+        "[%s] free: 8bit=%u dma=%u psram=%u | largest: 8bit=%u dma=%u psram=%u",
+        tag,
+        (unsigned)free_8bit,
+        (unsigned)free_dma,
+        (unsigned)free_spiram,
+        (unsigned)largest_8bit,
+        (unsigned)largest_dma,
+        (unsigned)largest_spiram
+    );
+}
 
 #ifdef ENABLE_CH_FILTER_M
     #include "biquad2.h"
@@ -50,6 +105,8 @@
     extern FxDelay delayfx;
 #endif
 
+#include "SamplePool.h"
+extern SamplePool samplePool;
 
 static const char* TAG = "Synth";
 
@@ -67,14 +124,67 @@ Synth::Synth(SF2Parser& parserRef) : parser(parserRef) {
     volume_scaler = 1.0f / sqrtf(MAX_VOICES);
 }
 
+void Synth::beginAssetUpdate() {
+    // Nested operations occur during SF2 load -> GMReset -> programChange().
+    // Only the outermost operation owns the Core0 pause handshake.
+    if (assetUpdateDepth++ != 0) return;
+
+    __atomic_store_n(&assetUpdateRequested, true, __ATOMIC_RELEASE);
+
+    // Core0 acknowledges only between render blocks. Until then no PCM
+    // pointer or pool allocation may be invalidated.
+    while (!__atomic_load_n(&audioAssetPaused, __ATOMIC_ACQUIRE)) {
+        taskYIELD();
+    }
+}
+
+void Synth::endAssetUpdate() {
+    if (assetUpdateDepth == 0) return;
+    if (--assetUpdateDepth != 0) return;
+
+    __atomic_store_n(&assetUpdateRequested, false, __ATOMIC_RELEASE);
+}
+
+bool Synth::audioAssetUpdateRequested() const {
+    return __atomic_load_n(&assetUpdateRequested, __ATOMIC_ACQUIRE);
+}
+
+void Synth::setAudioAssetPaused(bool paused) {
+    __atomic_store_n(&audioAssetPaused, paused, __ATOMIC_RELEASE);
+}
+
 bool Synth::begin() {
-    if (loadSynthState()) return true;
+    // loadSynthState() may load/parse an SF2. loadSf2File() now creates the
+    // sample arena only AFTER parser metadata is resident.
+    if (loadSynthState() && !parser.getSamples().empty()) return true;
+
+    // No saved SF2 was restored. Parse the parser's configured file with all
+    // PSRAM available to metadata, then give the remaining PSRAM to samples.
+    samplePool.deinit();
+
+    dump_mem_caps("before_parse");
+    dma_reserve_acquire();
+    dump_mem_caps("after_acquire");
 
     if (!parser.parse()) {
         ESP_LOGW(TAG, "No SF2 parsed. Auto-loading next SF2...");
+        dump_mem_caps("before_release");
+        dma_reserve_release();
+        dump_mem_caps("after_release");
         return loadNextSf2();
     }
 
+    dma_reserve_release();
+    dump_mem_caps("after_parse_before_pool");
+
+    if (!samplePool.init(1300 * 1024)) { // bytes kept free after metadata
+        ESP_LOGE(TAG, "Sample pool initialization failed after SF2 parse");
+        return false;
+    }
+
+    for (int ch = 0; ch < 16; ++ch) {
+        programChange(ch, channels[ch].program);
+    }
     return true;
 }
 
@@ -96,7 +206,13 @@ void Synth::noteOn(uint8_t ch, uint8_t note, uint8_t vel) {
     bool retrig = chan->monoMode != ChannelState::MonoLegato;
 
     auto zones = parser.getZonesForNote(note, vel, chan->getBank(), chan->program);
-    if (zones.empty()) return;
+    ESP_LOGI("NOTE", "ON ch=%u note=%u vel=%u bank=%u prog=%u zones=%u",
+             ch, note, vel, chan->getBank(), chan->program, (uint32_t)zones.size());
+    if (zones.empty()) {
+        ESP_LOGE("NOTE", "NO ZONES ch=%u note=%u bank=%u prog=%u",
+                 ch, note, chan->getBank(), chan->program);
+        return;
+    }
 
     chan->pushNote(note);
 
@@ -109,10 +225,28 @@ void Synth::noteOn(uint8_t ch, uint8_t note, uint8_t vel) {
 
             // Start new voices for all zones
             for (auto& zone : zones) {
-                if (!zone.sample) continue;
                 float score = vel * DIV_127;
-                Voice* v = allocateVoice(ch, note, score, zone.exclusiveClass);
-                if (v) v->startNew(ch, note, vel, zone, chan);
+
+                SampleHandle* h = samplePool.acquire(zone.sampleID);
+                if (!h) {
+                    ESP_LOGE("NOTE", "ACQUIRE FAIL ch=%u note=%u sid=%u [mono-retrig]",
+                             ch, note, zone.sampleID);
+                    continue;
+                }
+                ESP_LOGI("NOTE", "ACQUIRE OK ch=%u note=%u sid=%u ptr=%p len=%u rate=%u",
+                         ch, note, zone.sampleID, h->data, h->length, h->sampleRate);
+
+                Voice* v = allocateVoice(ch, note, score, zone.exclusiveClass); 
+                if (v) {
+                    v->sampleHandle = h;
+                    v->sampleID = zone.sampleID;
+                    v->startNew(ch, note, vel, zone, chan);
+                    ESP_LOGI("NOTE", "VOICE START ch=%u note=%u sid=%u voice=%p active=%u",
+                             ch, note, zone.sampleID, v, (unsigned)v->active);
+                } else {
+                    ESP_LOGE("NOTE", "VOICE ALLOC FAIL ch=%u note=%u sid=%u", ch, note, zone.sampleID);
+                    samplePool.release(zone.sampleID);
+                }
             }
         } else {
             // Legato: update pitch of ALL existing voices, or start new if none
@@ -130,20 +264,59 @@ void Synth::noteOn(uint8_t ch, uint8_t note, uint8_t vel) {
             if (!reused) {
                 // First note: start new voices
                 for (auto& zone : zones) {
-                    if (!zone.sample) continue;
+                    if (zone.sampleID >= parser.getSamples().size()) continue;
+
+                    SampleHandle* h = samplePool.acquire(zone.sampleID);
+                    if (!h) {
+                        ESP_LOGE("NOTE", "ACQUIRE FAIL ch=%u note=%u sid=%u [mono-legato-first]",
+                                 ch, note, zone.sampleID);
+                        continue;
+                    }
+                    ESP_LOGI("NOTE", "ACQUIRE OK ch=%u note=%u sid=%u ptr=%p len=%u rate=%u",
+                             ch, note, zone.sampleID, h->data, h->length, h->sampleRate);
+
                     float score = vel * DIV_127;
                     Voice* v = allocateVoice(ch, note, score, zone.exclusiveClass);
-                    if (v) v->startNew(ch, note, vel, zone, chan);
+                    if (v) {
+                        v->sampleHandle = h;
+                        v->sampleID = zone.sampleID;
+                        v->startNew(ch, note, vel, zone, chan);
+                        ESP_LOGI("NOTE", "VOICE START ch=%u note=%u sid=%u voice=%p active=%u",
+                                 ch, note, zone.sampleID, v, (unsigned)v->active);
+                    } else {
+                        ESP_LOGE("NOTE", "VOICE ALLOC FAIL ch=%u note=%u sid=%u", ch, note, zone.sampleID);
+                        samplePool.release(zone.sampleID);
+                    }
                 }
             }
         }
     } else {
         // Polyphonic: start new voices normally
         for (auto& zone : zones) {
-            if (!zone.sample) continue;
+            if (zone.sampleID >= parser.getSamples().size()) continue;
+
+            SampleHandle* h = samplePool.acquire(zone.sampleID);
+            if (!h) {
+                ESP_LOGE("NOTE", "ACQUIRE FAIL ch=%u note=%u sid=%u [poly]",
+                         ch, note, zone.sampleID);
+                continue;
+            }
+            ESP_LOGI("NOTE", "ACQUIRE OK ch=%u note=%u sid=%u ptr=%p len=%u rate=%u",
+                     ch, note, zone.sampleID, h->data, h->length, h->sampleRate);
+
             float score = vel * DIV_127;
             Voice* v = allocateVoice(ch, note, score, zone.exclusiveClass);
-            if (v) v->startNew(ch, note, vel, zone, chan);
+
+            if (v) {
+                v->sampleHandle = h;
+                v->sampleID = zone.sampleID;
+                v->startNew(ch, note, vel, zone, chan);
+                ESP_LOGI("NOTE", "VOICE START ch=%u note=%u sid=%u voice=%p active=%u",
+                         ch, note, zone.sampleID, v, (unsigned)v->active);
+            } else {
+                ESP_LOGE("NOTE", "VOICE ALLOC FAIL ch=%u note=%u sid=%u", ch, note, zone.sampleID);
+                samplePool.release(zone.sampleID);
+            }
         }
     }
     chan->portaCurrentNote = note;
@@ -194,9 +367,13 @@ void Synth::noteOff(uint8_t ch, uint8_t note) {
 
 
 Voice*  __attribute__((always_inline))   Synth::allocateVoice(uint8_t ch, uint8_t note, float newScore, uint32_t exclusiveClass){
-	Voice* v = findWeakestVoiceOnNote(ch, note, newScore, exclusiveClass);
-	if (!v) v = findWorstVoice();
-	return v;
+    Voice* v = findWeakestVoiceOnNote(ch, note, newScore, exclusiveClass);
+    if (!v) v = findWorstVoice();
+
+    // A returned slot may still own the previous voice's sample.
+    // Reuse is immediate, so release it before assigning a new handle.
+    if (v && v->active) v->kill();
+    return v;
 }
  
 
@@ -402,18 +579,193 @@ void Synth::applyBankProgram(uint8_t ch) {
     }
 }
 
-
-
 void Synth::programChange(uint8_t ch, uint8_t program) {
     if (ch >= 16) return;
+
+    beginAssetUpdate();
+
+    dump_mem_caps("before_prog_ch");
 
     auto& state = channels[ch];
     state.wantProgram = program & 0x7F;
 
+    // Program Change is a hard boundary in this sampler. Old notes do not
+    // survive it, which makes sample ownership deterministic.
+    allNotesOff(ch);
+    soundOff(ch);
+
     applyBankProgram(ch);
+
+    auto& all = parser.getSamples();
+    auto needed = parser.getSamplesForPreset(state.getBank(), state.program);
+
+    ESP_LOGI("PC", "ch=%u bank=%u program=%u needed=%u totalSamples=%u",
+             ch, state.getBank(), state.program,
+             (uint32_t)needed.size(), (uint32_t)all.size());
+
+    auto containsSample = [](const std::vector<SampleHeader*>& list,
+                             const SampleHeader* sample) -> bool {
+        for (auto* item : list)
+            if (item == sample) return true;
+        return false;
+    };
+
+    // First drop samples which this channel no longer needs. Shared samples
+    // stay pinned, so the normal browsing path reuses as much PCM as possible.
+    auto oldLoaded = std::move(state.loadedSamples);
+    state.loadedSamples.clear();
+
+    for (auto* sample : oldLoaded) {
+        if (!sample || containsSample(needed, sample)) continue;
+
+        if (sample->refCount) sample->refCount--;
+        samplePool.release(sample->sampleID);
+        if (!samplePool.get(sample->sampleID)) sample->data = nullptr;
+    }
+
+    state.loadedSamples.reserve(needed.size());
+
+    uint32_t loaded = 0;
+    uint32_t reused = 0;
+    bool incrementalOk = true;
+
+    for (auto* sample : needed) {
+        if (!sample || sample->sampleID >= all.size()) {
+            incrementalOk = false;
+            break;
+        }
+
+        // This channel already owned the sample before the PC. Keep that
+        // ownership unchanged; no acquire/release pair is needed.
+        if (containsSample(oldLoaded, sample)) {
+            SampleHandle* h = samplePool.get(sample->sampleID);
+            if (!h || !h->data) {
+                ESP_LOGE("PC", "resident sample missing during reuse: ch=%u sid=%u", ch, sample->sampleID);
+                incrementalOk = false;
+                break;
+            }
+
+            ESP_LOGI("PC", "KEEP sid=%u ptr=%p len=%u", sample->sampleID, h->data, h->length);
+            sample->data = h->data;
+            state.loadedSamples.push_back(sample);
+            reused++;
+            continue;
+        }
+
+        const uint32_t sid = sample->sampleID;
+        SampleHandle* h = samplePool.get(sid);
+
+        if (!h) {
+            ESP_LOGI("PC", "LOAD sid=%u", sid);
+            h = parser.readSampleIntoPool(sid);
+            if (!h) {
+                ESP_LOGE("PC", "LOAD FAIL sid=%u", sid);
+                incrementalOk = false;
+                break;
+            }
+            loaded++;
+        } else {
+            ESP_LOGI("PC", "FOUND sid=%u ptr=%p len=%u", sid, h->data, h->length);
+            reused++;
+        }
+
+        h = samplePool.acquire(sid);
+        if (!h || !h->data) {
+            ESP_LOGE("PC", "PIN FAIL sid=%u h=%p data=%p", sid, h, h ? h->data : nullptr);
+            incrementalOk = false;
+            break;
+        }
+        ESP_LOGI("PC", "PIN OK sid=%u ptr=%p len=%u", sid, h->data, h->length);
+
+        sample->data = h->data;
+        if (sample->refCount < UINT8_MAX) sample->refCount++;
+        state.loadedSamples.push_back(sample);
+    }
+
+    if (incrementalOk) {
+        ESP_LOGI("PC", "incremental OK: loaded=%u reused=%u",
+                 loaded, reused);
+        dump_mem_caps("after_prog_ch");
+        endAssetUpdate();
+        return;
+    }
+
+    ESP_LOGW("PC", "incremental allocation failed, rebuilding full layout");
+
+    // A full rebuild invalidates every pool pointer. Stop all voices first.
+    for (uint8_t c = 0; c < 16; ++c) soundOff(c);
+
+    // Forget all ownership and allocation metadata. The PSRAM arena itself is
+    // retained; only its logical layout is reset.
+    for (uint8_t c = 0; c < 16; ++c) channels[c].loadedSamples.clear();
+    for (auto& sample : all) {
+        sample.data = nullptr;
+        sample.refCount = 0;
+    }
+    samplePool.reset();
+
+    // Rebuild the union of samples required by all currently selected channel
+    // programs. Starting from an empty first-fit arena gives a packed layout.
+    bool rebuildOk = true;
+    uint32_t rebuiltLoaded = 0;
+    uint32_t rebuiltReused = 0;
+
+    for (uint8_t c = 0; c < 16 && rebuildOk; ++c) {
+        auto channelNeeded = parser.getSamplesForPreset(
+            channels[c].getBank(), channels[c].program);
+        channels[c].loadedSamples.reserve(channelNeeded.size());
+
+        for (auto* sample : channelNeeded) {
+            if (!sample || sample->sampleID >= all.size()) {
+                rebuildOk = false;
+                break;
+            }
+
+            const uint32_t sid = sample->sampleID;
+            SampleHandle* h = samplePool.get(sid);
+
+            if (!h) {
+                h = parser.readSampleIntoPool(sid);
+                if (!h) {
+                    rebuildOk = false;
+                    break;
+                }
+                rebuiltLoaded++;
+            } else {
+                rebuiltReused++;
+            }
+
+            h = samplePool.acquire(sid);
+            if (!h || !h->data) {
+                rebuildOk = false;
+                break;
+            }
+
+            sample->data = h->data;
+            if (sample->refCount < UINT8_MAX) sample->refCount++;
+            channels[c].loadedSamples.push_back(sample);
+        }
+    }
+
+    if (!rebuildOk) {
+        ESP_LOGE("PC", "FULL LAYOUT FAILED: current 16-channel working set does not fit");
+
+        for (uint8_t c = 0; c < 16; ++c) channels[c].loadedSamples.clear();
+        for (auto& sample : all) {
+            sample.data = nullptr;
+            sample.refCount = 0;
+        }
+        samplePool.reset();
+        dump_mem_caps("after_prog_ch_fail");
+        endAssetUpdate();
+        return;
+    }
+
+    ESP_LOGI("PC", "full layout OK: loaded=%u reused=%u",
+             rebuiltLoaded, rebuiltReused);
+    dump_mem_caps("after_prog_ch_rebuild");
+    endAssetUpdate();
 }
-
-
 
 // Inline filter processing to reduce function call overhead
 #define PROCESS_FILTER_LR(flt, inL, inR) { \
@@ -616,12 +968,19 @@ void Synth::updateScores() {
 }
 
 void Synth::reset() {
-    for (int ch = 0; ch < 16; ++ch) {
-        channels[ch].reset();   
-    }
+    // Release voice ownership before touching channel state.
+    for (Voice& v : voices) v.kill();
 
-    for (Voice& v : voices) {
-        v.kill();
+    // Release one pool reference for every channel-owned sample.
+    for (int ch = 0; ch < 16; ++ch) {
+        for (auto* sample : channels[ch].loadedSamples) {
+            if (!sample) continue;
+            if (sample->refCount) sample->refCount--;
+            samplePool.release(sample->sampleID);
+            if (!samplePool.get(sample->sampleID)) sample->data = nullptr;
+        }
+        channels[ch].loadedSamples.clear();
+        channels[ch].reset();
     }
 }
 
@@ -667,7 +1026,11 @@ void Synth::GMReset() {
         allNotesOff(ch);
         soundOff(ch);
     }
-
+    for (int ch = 0; ch < 16; ++ch) {
+        channels[ch].program = 0;
+        channels[ch].setBank(0);
+        programChange(ch, 0);
+    }
     ESP_LOGI(TAG, "General MIDI Reset complete, Channel 10 locked to drum bank.");
 }
 
@@ -784,39 +1147,64 @@ void Synth::scanSf2Files() {
 }
 
 bool Synth::loadSf2File(const char* filename) {
-    
+    beginAssetUpdate();
+
+    // First terminate every user of the current PCM while the old arena still
+    // exists, then return the entire arena to PSRAM before parsing metadata.
+    reset();
+    samplePool.deinit();
     parser.clear();
-    ESP_LOGI(TAG, "\n\nFree heap: %u, PSRAM: %u\n\n", heap_caps_get_free_size(MALLOC_CAP_8BIT), heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    ESP_LOGI(TAG, "\n\nFree heap before SF2 parse: %u, PSRAM: %u\n\n",
+             heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     fs::FS* fs = getFileSystem();
     if (!fs) {
         ESP_LOGE("Synth", "Filesystem not initialized");
+        endAssetUpdate();
         return false;
     }
 
-    reset();
+    String fullPath(filename);
+    if (!fullPath.startsWith(SF2_PATH))
+        fullPath = String(SF2_PATH) + filename;
 
-    String fullPath = String(SF2_PATH) + filename;
     ESP_LOGI("Synth", "\n\nLoading SF2: %s\n\n", fullPath.c_str());
 
     SF2Parser tempParser(fullPath.c_str(), fs);
+    dump_mem_caps("before_tmp_parse");
+    dma_reserve_acquire();
+
     if (!tempParser.parse()) {
         ESP_LOGE("Synth", "Failed to parse %s", fullPath.c_str());
+        dma_reserve_release();
+        dump_mem_caps("after_!tmp_parse");
+        endAssetUpdate();
         return false;
     }
 
+    dma_reserve_release();
     parser = std::move(tempParser);
+    dump_mem_caps("after_tmp_parse_before_pool");
 
-    reset();      // Stop voices and reset channels
-    GMReset();    // Apply GM defaults
-   // parser.dumpPresetStructure();
- 
-    currentSf2Path = String(fullPath); 
+    // Metadata is now resident. The sample arena may consume only what remains.
+    if (!samplePool.init(1300 * 1024)) {
+        ESP_LOGE(TAG, "Sample pool initialization failed after parsing %s",
+                 fullPath.c_str());
+        endAssetUpdate();
+        return false;
+    }
+    dump_mem_caps("after_pool_init");
+
+    GMReset();
+
+    currentSf2Path = fullPath;
+    endAssetUpdate();
     return true;
 }
 
 bool Synth::loadNextSf2() {
-    parser.clear();
     if (sf2Files.empty()) {
         scanSf2Files();
         if (sf2Files.empty()) {
@@ -929,17 +1317,6 @@ bool Synth::loadSynthState(const char* path) {
     auto map = readTLV(f);
     f.close();
 
-    for (int ch = 0; ch < 16; ++ch) {
-        auto it = map.find(PARAM_CHANNEL(ch));
-        if (it != map.end() && it->second.len == 3) {
-            auto& b = it->second.data;
-            channels[ch].wantBankMSB = b[0];
-            channels[ch].wantBankLSB = b[1];
-            channels[ch].wantProgram = b[2];
-            applyBankProgram(ch);
-        }
-    }
-
 #ifdef ENABLE_REVERB
     if (auto it = map.find(PARAM_REVERB_TIME); it != map.end() && it->second.len == 4) {
         float v; memcpy(&v, it->second.data.data(), 4); reverb.setTime(v);
@@ -959,26 +1336,43 @@ bool Synth::loadSynthState(const char* path) {
     }
 #endif
 
-    FileSystemType loadedFsType = FileSystemType::LITTLEFS; // default
-
-    if (auto it = map.find(PARAM_SF2_FS_TYPE); it != map.end() && it->second.len == 1) {
+    FileSystemType loadedFsType = FileSystemType::LITTLEFS;
+    if (auto it = map.find(PARAM_SF2_FS_TYPE); it != map.end() && it->second.len == 1)
         loadedFsType = static_cast<FileSystemType>(it->second.data[0]);
-    }
 
-
+    // Load the SF2 first. This parses metadata with the sample arena released,
+    // then creates the arena and establishes a valid default working set.
+    bool sf2Loaded = false;
     if (auto it = map.find(PARAM_SF2_FILENAME); it != map.end() && it->second.len > 0) {
         const char* name = (const char*)it->second.data.data();
-        fs::FS* fs = (loadedFsType == FileSystemType::SD)
+        fs::FS* sf = (loadedFsType == FileSystemType::SD)
            ? static_cast<fs::FS*>(&SD_MMC)
            : static_cast<fs::FS*>(&LittleFS);
 
-        if (fs->exists(name)) {
+        if (sf->exists(name)) {
             setFileSystem(loadedFsType);
-            loadSf2File(name);  // full path relative to chosen FS
+            sf2Loaded = loadSf2File(name);
         } else {
             ESP_LOGW(TAG, "Saved SF2 not found: %s (FS=%s)", name,
                     loadedFsType == FileSystemType::SD ? "SD" : "LFS");
         }
     }
+
+    if (!sf2Loaded) return false;
+
+    // Only now resolve saved banks/programs against the populated parser.
+    for (int ch = 0; ch < 16; ++ch) {
+        auto it = map.find(PARAM_CHANNEL(ch));
+        if (it == map.end() || it->second.len != 3) continue;
+
+        auto& b = it->second.data;
+        channels[ch].wantBankMSB = b[0];
+        channels[ch].wantBankLSB = b[1];
+        channels[ch].wantProgram = b[2];
+        programChange(ch, channels[ch].wantProgram);
+    }
+
     return true;
 }
+
+

@@ -28,8 +28,13 @@
 #include <FS.h>
 #include <vector>
 #include <map>
+#include "SamplePool.h"
 
 #include <LittleFS.h>
+
+
+
+
 
 struct __attribute__((packed)) Generator {
     uint16_t oper;
@@ -43,41 +48,48 @@ struct __attribute__((packed)) Generator {
     } amount;
 };
 
-struct __attribute__((packed)) SampleHeader {
+struct SampleHeader {
+
     char name[20];
+
     uint32_t start;
     uint32_t end;
     uint32_t startLoop;
     uint32_t endLoop;
     uint32_t sampleRate;
+
     uint8_t originalPitch;
     int8_t pitchCorrection;
     uint16_t sampleLink;
     uint16_t sampleType;
-    uint8_t* data = nullptr;
+
+    const int16_t* data;
     size_t dataSize = 0;
-    inline uint8_t getLoopMode() const {
-        return sampleType & 0x0003;
-    }
+    uint32_t sampleID = 0;
+
+    bool cached = false;
+    uint8_t refCount = 0;   // channels using this sample
+	uint16_t poolBlocks = 0; 
 };
 
 
-struct Zone {    // --- Обязательные параметры ---
+struct Zone {    // --- Mandatory params ---
     uint8_t velLo = 0;
     uint8_t velHi = 127;
     uint8_t keyLo = 0;
     uint8_t keyHi = 127;
     SampleHeader* sample = nullptr;
+    uint32_t sampleID;
     
-    // --- Генераторы из SF2 ---
-    int rootKey = -1;          // OverridingRootKey (если нет → sample->originalPitch)
-    int sampleModes = 0;       // SampleModes (тип лупа)
+    // --- generators from SF2 ---
+    int rootKey = -1;          // OverridingRootKey (if no -> sample->originalPitch)
+    int sampleModes = 0;       // SampleModes (loop type)
     int exclusiveClass = 0;    // ExclusiveClass
-    float fineTune = 0.0f;     // FineTune (в центах)
-    float coarseTune = 0.0f;   // CoarseTune (в полутонах)
+    float fineTune = 0.0f;     // FineTune (cents)
+    float coarseTune = 0.0f;   // CoarseTune (semitones)
     
-    // --- Огибающая амплитуды ---
-    float attackTime = 0.0f;   // AttackVolEnv (в секундах)
+    // --- amp envelope ---
+    float attackTime = 0.0f;   // AttackVolEnv (seconds)
     float holdTime = 0.0f;
     float decayTime = 0.0f;    // DecayVolEnv
     float sustainLevel = 1.0f; // SustainVolEnv (0.0–1.0)
@@ -102,11 +114,11 @@ struct Zone {    // --- Обязательные параметры ---
     float modLfoToVolume = 0.0f;      // centibels
     float modLfoToFilterFc = 0.0f;    // cents
     
-    // --- Фильтр ---
-    float filterFc = 13500.0f; // InitialFilterFc (частота среза)
-    float filterQ = 0.0f;      // InitialFilterQ (добротность)
+    // --- filter ---
+    float filterFc = 13500.0f; // InitialFilterFc (cutoff)
+    float filterQ = 0.0f;      // InitialFilterQ (reso)
     
-    // --- Эффекты ---
+    // --- effects ---
     float reverbSend = 0.0f;   // ReverbEffectsSend (0.0–1.0)
     float chorusSend = 0.0f;   // ChorusEffectsSend
     
@@ -136,6 +148,7 @@ struct SF2Preset {
 };
 
 
+
 class SF2Parser {
 public:
     SF2Parser(const char* path, fs::FS* fs = &LittleFS);
@@ -147,8 +160,15 @@ public:
     void dumpPresetStructure() ;
     bool hasPreset(uint16_t bank, uint16_t program) const ;
     void clear();
+    std::vector<SampleHeader*> getSamplesForPreset(uint16_t bank, uint16_t program);
+    bool loadSample(SampleHeader& s);
+ 
+    SampleHandle* readSampleIntoPool(uint32_t sid);
+    bool preloadAllIntoPool();
+    void dumpInstrumentSizes();
 
 private:
+    uint32_t smplStart;
     bool parseHeaderChunks();
     bool parseSDTA();
     bool parsePDTA();
@@ -156,15 +176,14 @@ private:
     bool parseInstrumentZones();
     bool readSampleHeaders(uint32_t offset, uint32_t size);
     SampleHeader* resolveSample(uint32_t sampleID);
-    uint32_t hashSampleName(const char* name) ;
-    bool loadSampleDataToMemory();
+    uint32_t hashSampleName(const char* name) ; 
     void applyGenerators(const std::vector<Generator>& gens, Zone& zone) ;
 
-    File file;
+    File file; 
     String filepath;
     
     fs::FS* filesystem;
-    std::vector<SampleHeader> samples;
+    std::vector<SampleHeader>  samples;
     std::vector<Zone> zones; 
     std::vector<SF2Preset> presets;
     std::vector<SF2Instrument> instruments;

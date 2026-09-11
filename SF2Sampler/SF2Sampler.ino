@@ -45,11 +45,14 @@ static const char* TAG = "Main";
 #include "sdmmc_cmd.h"
 
 #include <MIDI.h>
+#include "SamplePool.h"
 #include "synth.h"
 #include "SF2Parser.h"
 #include "adsr.h"
 #include "voice.h"
 #include "SynthState.h"
+
+SET_LOOP_TASK_STACK_SIZE(80000);
 
 #ifdef ENABLE_RGB_LED
     #include "rgb_led.h"
@@ -69,6 +72,8 @@ TaskHandle_t Task3;
 int Voice::usage; // counts voices internally
 
 
+uint8_t* g_sd_dma_buf = nullptr;
+
 // ========================== MIDI Instance ===============================================================================================
 #if MIDI_IN_DEV == USE_MIDI_STANDARD
     MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDI);
@@ -79,6 +84,9 @@ int Voice::usage; // counts voices internally
 #endif
 
 // ========================== Global devices ===============================================================================================
+
+SamplePool samplePool;
+
 #ifdef ENABLE_CHORUS
     #include "fx_chorus.h"
     FxChorus    DRAM_ATTR   chorus;
@@ -166,12 +174,24 @@ void handleSystemExclusive( uint8_t* data, size_t len) {
 // ========================== Core 0 Task 1 ===============================================================================================
 // Core0 task -- AUDIO
 static void IRAM_ATTR audio_task(void *userData) {
-    vTaskDelay(20); 
+    vTaskDelay(10); 
     ESP_LOGI(TAG, "Starting Task1");
-
-
+    vTaskDelay(40); 
 
     while (true) {
+
+        // Program/SF2 changes may free or rebuild PCM on Core1. A request is
+        // acknowledged only here, between complete render blocks. While it is
+        // active we keep I2S fed with silence and never touch Voice PCM.
+        if (__builtin_expect(synth.audioAssetUpdateRequested(), 0)) {
+            synth.setAudioAssetPaused(true);
+            memset(blockL, 0, sizeof(blockL));
+            memset(blockR, 0, sizeof(blockR));
+            AudioPort.writeBuffers(blockL, blockR);
+            frame_count++;
+            continue;
+        }
+        synth.setAudioAssetPaused(false);
         
 #ifdef TASK_BENCHMARKING
         t0 = esp_cpu_get_cycle_count();
@@ -203,9 +223,11 @@ static void IRAM_ATTR audio_task(void *userData) {
 
 // ========================== Core 1 Task 2 ===============================================================================================
 static void IRAM_ATTR control_task(void *userData) { 
-    vTaskDelay(50);
+    vTaskDelay(20);
     ESP_LOGI(TAG, "Starting Task2");
     
+    vTaskDelay(40);
+
     while (true) { 
         MIDI.read();
         synth.updateScores();
@@ -251,8 +273,10 @@ static void IRAM_ATTR control_task(void *userData) {
 #ifdef ENABLE_GUI
 // ========================== Core 1 Task 3 ===============================================================================================
 static void IRAM_ATTR gui_task(void *userData) { 
-    vTaskDelay(50);
+    vTaskDelay(30);
     ESP_LOGI(TAG, "Starting Task3");
+    
+    vTaskDelay(30); 
     
     while (true) {
         if (gui_blocker == 0) {
@@ -273,6 +297,9 @@ void setup() {
     }
     //btStop(); 
     
+
+g_sd_dma_buf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_DMA);
+
 #if MIDI_IN_DEV == USE_USB_MIDI_DEVICE
   // Change USB Device Descriptor Parameter
     USB.VID(0x1209);
@@ -294,12 +321,29 @@ void setup() {
     MIDI.setHandleProgramChange(handleProgramChange);
     MIDI.setHandleSystemExclusive(handleSystemExclusive);
 
-    delay(800);
     ESP_LOGI(TAG, "MIDI started");
 
-  //  SDMMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0, SDMMC_D1, SDMMC_D2, SDMMC_D3)
+
+//    SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0);
+
+
+    gpio_pulldown_dis((gpio_num_t)SDMMC_D0);
+    gpio_pulldown_dis((gpio_num_t)SDMMC_D1);
+    gpio_pulldown_dis((gpio_num_t)SDMMC_D2); 
+    gpio_pulldown_dis((gpio_num_t)SDMMC_D3);
+    gpio_pulldown_dis((gpio_num_t)SDMMC_CLK);
+    gpio_pulldown_dis((gpio_num_t)SDMMC_CMD);
+    gpio_pullup_en((gpio_num_t)SDMMC_D0);
+    gpio_pullup_en((gpio_num_t)SDMMC_D1);
+    gpio_pullup_en((gpio_num_t)SDMMC_D2); 
+    gpio_pullup_en((gpio_num_t)SDMMC_D3);
+    gpio_pullup_en((gpio_num_t)SDMMC_CLK);
+    gpio_pullup_en((gpio_num_t)SDMMC_CMD);
+
+
     SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0, SDMMC_D1, SDMMC_D2, SDMMC_D3);
  
+    ESP_LOGI(TAG, "SDMMC pins set");
     if (!SD_MMC.begin()) {
         ESP_LOGE(TAG, "SD init failed");
     } else {
@@ -315,11 +359,15 @@ void setup() {
         ESP_LOGI(TAG, "LittleFS initialized");
     }
 
+
 #ifdef ENABLE_GUI
     gui.begin();
     gui.busyMessage( "Synth Loading...");
     ESP_LOGI(TAG, "GUI splash");
 #endif
+
+    ESP_LOGI(TAG, "GUI passed");
+    delay(800);
 
 #ifdef ENABLE_REVERB
     reverb.init();
@@ -331,26 +379,23 @@ void setup() {
     ESP_LOGI(TAG, "Delay FX started");
 #endif
  
-
-    synth.begin();
-    ESP_LOGI(TAG, "Synth is starting");
+    AudioPort.init(I2S_Audio::MODE_OUT);
+    ESP_LOGI(TAG, "I2S Audio port started");
+    
 
 #ifdef ENABLE_GUI
     gui.startMenu();
     ESP_LOGI(TAG, "GUI started");
 #endif
 
-    AudioPort.init(I2S_Audio::MODE_OUT);
-    ESP_LOGI(TAG, "I2S Audio port started");
 
 #ifdef ENABLE_RGB_LED
     setupLed();
     ESP_LOGI(TAG, "RGB LED started");
 #endif
 
-
+    xTaskCreatePinnedToCore( control_task, "ControlTask", 5000, NULL, 5, &Task2, 1 );
     xTaskCreatePinnedToCore( audio_task, "SynthTask", 5000, NULL, 8, &Task1, 0 );
-    xTaskCreatePinnedToCore( control_task, "ControlTask", 5000, NULL, 8, &Task2, 1 );
 
 #ifdef ENABLE_GUI
     xTaskCreatePinnedToCore( gui_task, "GUITask", 5000, NULL, 5, &Task3, 1 );
@@ -358,11 +403,15 @@ void setup() {
 
     vTaskDelay(30);
 
+    synth.begin();
+    ESP_LOGI(TAG, "Synth is starting");
     ESP_LOGI(TAG, "SF2 Synth ready");
 }
 
 
 // ====================== LOOP ================= KILL IT OR NOT =========================================================
 void loop() {
+    
+    vTaskDelay(100); 
     vTaskDelete(NULL);
 }

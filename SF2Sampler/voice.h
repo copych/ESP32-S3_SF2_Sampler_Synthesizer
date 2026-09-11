@@ -30,7 +30,7 @@
 #include "SF2Parser.h"
 #include "adsr.h"
 #include "biquad2.h"
-
+#include "SamplePool.h"
 
 enum LoopType {
     NO_LOOP = 0,
@@ -108,12 +108,14 @@ struct DRAM_ATTR Voice {
     uint32_t  loopLength = 0;
     uint32_t  active = false; 
     uint32_t  forward = true; // for ping-pong
-    LoopType  loopType = NO_LOOP;
-    SampleHeader* sample = nullptr;
+    LoopType  loopType = NO_LOOP; 
     Zone zone = {};
   //  ChannelState* ch = nullptr; 
 
-    int16_t* data;
+    SampleHandle* sampleHandle = nullptr;
+    uint32_t sampleID = 0;
+
+    const int16_t* data = nullptr;
 
     Adsr ampEnv;
 
@@ -128,6 +130,7 @@ struct DRAM_ATTR Voice {
     void stop();
     void kill();
     void die();
+    void releaseSample();
     bool isRunning() const;
     float nextSample();
     void renderBlock(float* block);
@@ -162,4 +165,5 @@ struct DRAM_ATTR Voice {
     void printState();
     bool isLegato = false;
 };
+
 

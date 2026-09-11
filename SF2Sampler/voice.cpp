@@ -25,9 +25,10 @@
 
 #include "voice.h"
 #include "misc.h"
-
 #include <esp_dsp.h>
 
+#include "SamplePool.h"
+extern SamplePool samplePool;
 static const char* TAG = "Voice";
 
 inline float velocityToGain(uint32_t velocity) {
@@ -37,11 +38,20 @@ inline float velocityToGain(uint32_t velocity) {
 }
 
 
-
 void Voice::prepareStart(uint8_t ch, uint8_t note_, uint8_t vel, const Zone& z, ChannelState* chan) {
     zone = z;
-    sample = zone.sample;
-    data = reinterpret_cast<int16_t*>(__builtin_assume_aligned(sample->data, 4));
+
+    sampleID = zone.sampleID; 
+    // expect sampleHandle already set before calling prepareStart
+    if (!sampleHandle) {
+        active = false;
+        return;
+    }
+
+    data = (const int16_t*)__builtin_assume_aligned(sampleHandle->data, 4);
+    ESP_LOGI("VOICE", "PREP ch=%u note=%u sid=%u handle=%p data=%p len=%u rate=%u",
+             ch, note_, zone.sampleID, sampleHandle, sampleHandle->data,
+             sampleHandle->length, sampleHandle->sampleRate);
 
     int startNote = chan->portaCurrentNote;
 
@@ -49,7 +59,7 @@ void Voice::prepareStart(uint8_t ch, uint8_t note_, uint8_t vel, const Zone& z, 
     velocity = vel;
     channel = ch;
     forward = true;
-    phase = 1.0f; // interpolation uses -1, so first will be 0 and branchless
+    phase = 1.0f;
     noteHeld = true;
     samplesRun = lastSamplesRun = 0;
     exclusiveClass = zone.exclusiveClass;
@@ -62,7 +72,7 @@ void Voice::prepareStart(uint8_t ch, uint8_t note_, uint8_t vel, const Zone& z, 
     modSustain = &chan->sustainPedal;
     modPortaTime = &chan->portaTime;
     modPortamento = &chan->portamento;
- 
+
     chFilter.setCoeffs(&chan->filterCoeffs);
     chFilter.resetState();
 
@@ -71,10 +81,11 @@ void Voice::prepareStart(uint8_t ch, uint8_t note_, uint8_t vel, const Zone& z, 
     float modEnvStaticTune = (zone.modAttackTime < 1.0f) ?
         (1.0f - zone.modSustainLevel) * zone.modEnvToPitch * 0.01f : 0.0f;
 
-    int rootKey = (zone.rootKey >= 0) ? zone.rootKey : sample->originalPitch;
-    float semi = float(note_ - rootKey) + (sample->pitchCorrection * 0.01f) + zone.coarseTune + zone.fineTune + chan->tuningSemitones;
+    int rootKey = (zone.rootKey >= 0) ? zone.rootKey : sampleHandle->rootKey;
+    float semi = float(note_ - rootKey) + zone.coarseTune + zone.fineTune + chan->tuningSemitones;
+
     float noteRatio = exp2f((modEnvStaticTune + semi) * DIV_12);
-    float baseStep = float(sample->sampleRate) * DIV_SAMPLE_RATE;
+    float baseStep = float(sampleHandle->sampleRate) * DIV_SAMPLE_RATE;
     basePhaseIncrement = baseStep * noteRatio;
 
     vibLfoPhase = 0.0f;
@@ -112,13 +123,15 @@ void Voice::prepareStart(uint8_t ch, uint8_t note_, uint8_t vel, const Zone& z, 
     ampEnv.setReleaseTime(zone.releaseTime * chan->releaseModifier);
 
     int32_t loopStartOffset = zone.loopStartOffset + (zone.loopStartCoarseOffset << 15);
-    int32_t loopEndOffset = zone.loopEndOffset + (zone.loopEndCoarseOffset << 15);
-    length = sample->end - sample->start;
-    loopStart = sample->startLoop + loopStartOffset - sample->start;
-    loopEnd = sample->endLoop + loopEndOffset - sample->start;
+    int32_t loopEndOffset   = zone.loopEndOffset   + (zone.loopEndCoarseOffset << 15);
+
+    length    = sampleHandle->length;
+    loopStart = sampleHandle->loopStart + loopStartOffset;
+    loopEnd   = sampleHandle->loopEnd   + loopEndOffset;
     loopLength = loopEnd - loopStart;
+
     loopType = static_cast<LoopType>(zone.sampleModes & 0x0003);
-    if (loopType == UNUSED || loopStart < 0 || loopEnd > length || loopLength <= 0) {
+    if (loopType == UNUSED || loopStart >= loopEnd || loopEnd > length) {
         loopType = NO_LOOP;
     }
 
@@ -128,37 +141,42 @@ void Voice::prepareStart(uint8_t ch, uint8_t note_, uint8_t vel, const Zone& z, 
     filter.resetState();
     filter.setFreqAndQ(filterCutoff, filterResonance);
 #endif
-
-    ESP_LOGD(TAG, "ch=%d note=%d atk=%.5f hld=%.5f dcy=%.5f sus=%.3f rel=%.5f loopStart=%u loopEnd=%u loopType=%d",
-        channel, note, zone.attackTime, zone.holdTime, zone.decayTime, zone.sustainLevel, zone.releaseTime,
-        static_cast<uint32_t>(loopStart), static_cast<uint32_t>(loopEnd), loopType);
-
-    ESP_LOGD(TAG, "ch=%d reverb=%.5f chorus=%.5f delay=%.5f", channel, reverbAmount, chorusAmount, ch->delaySend);
-
-    ESP_LOGD(TAG, "modToPitch=%.3f modEnvSustain=%.5f coarseTune=%.3f fineTune=%.3f", zone.modEnvToPitch, zone.modSustainLevel, zone.coarseTune, zone.fineTune);
-
 }
 
 void Voice::startNew(uint8_t ch, uint8_t note_, uint8_t vel, const Zone& z, ChannelState* chan) {
     prepareStart(ch, note_, vel, z, chan);
+    if (!sampleHandle || !data) {
+        ESP_LOGE("VOICE", "START ABORT ch=%u note=%u sid=%u handle=%p data=%p",
+                 ch, note_, z.sampleID, sampleHandle, data);
+        active = false;
+        return;
+    }
     ampEnv.retrigger(Adsr::END_NOW);
     active = true;
+    ESP_LOGI("VOICE", "START OK ch=%u note=%u sid=%u phase=%.3f inc=%.6f len=%u loop=%u [%u..%u]",
+             ch, note_, z.sampleID, phase, effectivePhaseIncrement, length,
+             (unsigned)loopType, (unsigned)loopStart, (unsigned)loopEnd);
 }
 
 
-void Voice::updatePitchOnly(uint8_t newNote, ChannelState* chan) {    
-    int rootKey = (zone.rootKey >= 0) ? zone.rootKey : sample->originalPitch;
-    float semi = float(newNote - rootKey) + (sample->pitchCorrection * 0.01f) + zone.coarseTune + zone.fineTune;
-    float noteRatio = exp2f(semi * DIV_12);
-    basePhaseIncrement = float(sample->sampleRate) * DIV_SAMPLE_RATE * noteRatio;
+void Voice::updatePitchOnly(uint8_t newNote, ChannelState* chan) {
+    if (!sampleHandle) return;
 
-    portamentoActive = modPortamento && *modPortamento; 
+    int rootKey = (zone.rootKey >= 0) ? zone.rootKey : sampleHandle->rootKey;
+
+    float semi = float(newNote - rootKey) + zone.coarseTune + zone.fineTune;
+    float noteRatio = exp2f(semi * DIV_12);
+
+    basePhaseIncrement = float(sampleHandle->sampleRate) * DIV_SAMPLE_RATE * noteRatio;
+
+    portamentoActive = modPortamento && *modPortamento;
+
     if (portamentoActive) {
         float noteDiff = float(newNote - chan->portaCurrentNote);
         float freqRatio = exp2f(noteDiff * DIV_12);
         float timeSec = 0.01f + (*modPortaTime) * 0.5f;
         float totalSamples = timeSec * SAMPLE_RATE;
-       // currentPhaseIncrement = basePhaseIncrement / freqRatio;
+
         portamentoFactor = 1.0f / freqRatio;
         portamentoLogDelta = exp2f(log2f(freqRatio) / totalSamples);
     } else {
@@ -168,9 +186,7 @@ void Voice::updatePitchOnly(uint8_t newNote, ChannelState* chan) {
     }
 
     note = newNote;
-    
     updatePitch();
-    ESP_LOGD(TAG, "Pitch recalc v_id %d portaFactor %.5f", id, portamentoFactor);
 }
 
 
@@ -182,7 +198,15 @@ void Voice::stop() {
     }
 }
 
+void Voice::releaseSample() {
+    if (!sampleHandle) return;
+    samplePool.release(sampleID);
+    sampleHandle = nullptr;
+    data = nullptr;
+}
+
 void Voice::kill() {
+    releaseSample();
     ampEnv.end(Adsr::END_NOW);
     noteHeld = false;
     active = false;
@@ -198,7 +222,7 @@ bool Voice::isRunning() const {
 }
 
 float __attribute__((hot,always_inline)) IRAM_ATTR Voice::nextSample() {
-    if (!sample) {
+    if (!sampleHandle) {
         active = false;
         return 0.0f;
     }
@@ -249,6 +273,7 @@ float __attribute__((hot,always_inline)) IRAM_ATTR Voice::nextSample() {
             } else {
               loopType = NO_LOOP; // switch to a simplier route
               if (phase >= length) {
+                  releaseSample();
                   active = false;
                   return 0.0f;
               }
@@ -275,6 +300,7 @@ float __attribute__((hot,always_inline)) IRAM_ATTR Voice::nextSample() {
         default:
             phase += effectivePhaseIncrement;
             if (phase >= length) {
+                releaseSample();
                 active = false;
                 return 0.0f;
             }
@@ -282,6 +308,7 @@ float __attribute__((hot,always_inline)) IRAM_ATTR Voice::nextSample() {
     }
 
     if (ampEnv.isIdle()) {
+        releaseSample();
         active = false;
         return 0.0f;
     }
@@ -297,7 +324,7 @@ void Voice::renderBlock(float* block) {
 }
 
 void Voice::updateScore() {
-    if (!active || !sample) {
+    if (!active || !sampleHandle) {
         score = 0.0f;
         return;
     }
@@ -348,17 +375,18 @@ void __attribute__((always_inline))  Voice::updatePitchFactors() {
     // modFactor = ...
 }
 
-
 void Voice::init() {
     active = false;
     panL = 1.0f;
     panR = 1.0f;
     velocityVolume = 1.0f;
-    sample = nullptr;
+
+    sampleHandle = nullptr;
+    data = nullptr;
+
     ampEnv.init(SAMPLE_RATE);
     id = usage;
     usage++;
-    ESP_LOGD(TAG, "id=%d sr=%d", id, SAMPLE_RATE);
 }
 
 void Voice::printState() {
