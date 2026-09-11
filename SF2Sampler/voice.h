@@ -106,7 +106,28 @@ struct DRAM_ATTR Voice {
     uint32_t  loopStart = 0;
     uint32_t  loopEnd = 0;
     uint32_t  loopLength = 0;
-    uint32_t  active = false; 
+    uint32_t  active = false;
+
+    // Cross-core voice ownership. Core0 holds this for the complete per-voice
+    // audio block; Core1 takes it for lifetime/restart mutations. This keeps
+    // start/stop/steal operations out of nextSample() without adding a
+    // per-sample synchronization branch.
+    volatile uint32_t stateLock = 0;
+
+    inline bool __attribute__((always_inline)) tryLockState() {
+        uint32_t expected = 0;
+        return __atomic_compare_exchange_n(&stateLock, &expected, 1, false,
+                                           __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+    }
+
+    inline void lockState() {
+        while (!tryLockState()) taskYIELD();
+    }
+
+    inline void __attribute__((always_inline)) unlockState() {
+        __atomic_store_n(&stateLock, 0, __ATOMIC_RELEASE);
+    }
+
     uint32_t  forward = true; // for ping-pong
     LoopType  loopType = NO_LOOP; 
     Zone zone = {};

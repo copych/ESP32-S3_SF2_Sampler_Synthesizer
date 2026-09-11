@@ -49,9 +49,9 @@ void Voice::prepareStart(uint8_t ch, uint8_t note_, uint8_t vel, const Zone& z, 
     }
 
     data = (const int16_t*)__builtin_assume_aligned(sampleHandle->data, 4);
-    ESP_LOGI("VOICE", "PREP ch=%u note=%u sid=%u handle=%p data=%p len=%u rate=%u",
-             ch, note_, zone.sampleID, sampleHandle, sampleHandle->data,
-             sampleHandle->length, sampleHandle->sampleRate);
+  //  ESP_LOGI("VOICE", "PREP ch=%u note=%u sid=%u handle=%p data=%p len=%u rate=%u",
+  //           ch, note_, zone.sampleID, sampleHandle, sampleHandle->data,
+  //           sampleHandle->length, sampleHandle->sampleRate);
 
     int startNote = chan->portaCurrentNote;
 
@@ -153,9 +153,9 @@ void Voice::startNew(uint8_t ch, uint8_t note_, uint8_t vel, const Zone& z, Chan
     }
     ampEnv.retrigger(Adsr::END_NOW);
     active = true;
-    ESP_LOGI("VOICE", "START OK ch=%u note=%u sid=%u phase=%.3f inc=%.6f len=%u loop=%u [%u..%u]",
-             ch, note_, z.sampleID, phase, effectivePhaseIncrement, length,
-             (unsigned)loopType, (unsigned)loopStart, (unsigned)loopEnd);
+ //   ESP_LOGI("VOICE", "START OK ch=%u note=%u sid=%u phase=%.3f inc=%.6f len=%u loop=%u [%u..%u]",
+ //            ch, note_, z.sampleID, phase, effectivePhaseIncrement, length,
+ //            (unsigned)loopType, (unsigned)loopStart, (unsigned)loopEnd);
 }
 
 
@@ -235,6 +235,36 @@ float __attribute__((hot,always_inline)) IRAM_ATTR Voice::nextSample() {
     // Sample fetch + linear interpolation (unrolled and minimal branching)
     uint32_t idx = (uint32_t)phase;
     float frac = phase - (float)idx;
+
+
+if (__builtin_expect(
+        !data ||
+        idx == 0 ||
+        idx >= (uint32_t)length,
+        0)) {
+
+    ESP_EARLY_LOGE(
+        "VOICE",
+        "BAD FETCH v=%u active=%d handle=%p data=%p "
+        "phase=%f idx=%u len=%f sid=%u loop=%u",
+        id,
+        active,
+        sampleHandle,
+        data,
+        phase,
+        idx,
+        length,
+        sampleID,
+        loopType
+    );
+
+    active = false;
+    return 0.0f;
+}
+
+
+
+
 
     // float s0 = data[(idx > 0) ? (idx - 1) : 0];
     // phase[0] = 1.0, so never <= 0, cons: we never get clean 1st sample, pros: it's branchless

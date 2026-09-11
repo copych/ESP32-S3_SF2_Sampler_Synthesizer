@@ -3,11 +3,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include "esp_heap_caps.h"
+#include "config.h"
 
 // ===== CONFIG (upper bounds only) =====
 
-#define POOL_BLOCK_SIZE   4096u
-#define POOL_BLOCK_SHIFT  12u
+static_assert((SAMPLE_POOL_BLOCK_SIZE & (SAMPLE_POOL_BLOCK_SIZE - 1u)) == 0u,
+              "SAMPLE_POOL_BLOCK_SIZE must be a power of two");
 
 #define HASH_SIZE              512u   // keep power of 2
 
@@ -50,16 +51,16 @@ public:
 
         uint32_t free = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
 
-        if (free <= reserveBytes + POOL_BLOCK_SIZE)
+        if (free <= reserveBytes + SAMPLE_POOL_BLOCK_SIZE)
             return false;
 
         uint32_t target = free - reserveBytes;
 
         // align down to block size
-        target &= ~(POOL_BLOCK_SIZE - 1);
+        target &= ~(SAMPLE_POOL_BLOCK_SIZE - 1);
 
-        maxBlocks = target >> POOL_BLOCK_SHIFT;
-        totalBytes = maxBlocks << POOL_BLOCK_SHIFT;
+        maxBlocks = target / SAMPLE_POOL_BLOCK_SIZE;
+        totalBytes = maxBlocks * SAMPLE_POOL_BLOCK_SIZE;
 
         // --- allocate pool ---
         rawPool = (uint8_t*)heap_caps_malloc(
@@ -87,7 +88,7 @@ public:
 
         ESP_LOGI("POOL",
             "INIT: total=%u KB blocks=%u blockSize=%u",
-            totalBytes >> 10, maxBlocks, POOL_BLOCK_SIZE);
+            totalBytes >> 10, maxBlocks, SAMPLE_POOL_BLOCK_SIZE);
 
         return true;
     }
@@ -176,19 +177,19 @@ public:
 
         uint32_t sizeBytes = lengthSamples << 1;
         uint32_t blocksNeeded =
-            (sizeBytes + (POOL_BLOCK_SIZE - 1)) >> POOL_BLOCK_SHIFT;
+            (sizeBytes + (SAMPLE_POOL_BLOCK_SIZE - 1u)) / SAMPLE_POOL_BLOCK_SIZE;
 
         int32_t startBlock = allocBlocks(blocksNeeded);
         if (startBlock < 0) return nullptr;
 
-        uint32_t offset = ((uint32_t)startBlock) << POOL_BLOCK_SHIFT;
+        uint32_t offset = ((uint32_t)startBlock) * SAMPLE_POOL_BLOCK_SIZE;
         int16_t* dst = (int16_t*)(pool + offset);
 
         memcpy(dst, src, sizeBytes);
 
         SampleEntry* e = insertEntry(key); 
         if (!e) {
-            freeBlocks(((uint32_t)startBlock) << POOL_BLOCK_SHIFT, sizeBytes);
+            freeBlocks(((uint32_t)startBlock) * SAMPLE_POOL_BLOCK_SIZE, sizeBytes);
             return nullptr;
         }
 
@@ -244,18 +245,18 @@ public:
         uint32_t sizeBytes = lengthSamples << 1;
 
         uint32_t blocksNeeded =
-            (sizeBytes + (POOL_BLOCK_SIZE - 1)) >> POOL_BLOCK_SHIFT;
+            (sizeBytes + (SAMPLE_POOL_BLOCK_SIZE - 1u)) / SAMPLE_POOL_BLOCK_SIZE;
 
         int32_t startBlock = allocBlocks(blocksNeeded);
         if (startBlock < 0) return nullptr;
 
         SampleEntry* e = insertEntry(key);
         if (!e) {
-            freeBlocks(((uint32_t)startBlock) << POOL_BLOCK_SHIFT, sizeBytes);
+            freeBlocks(((uint32_t)startBlock) * SAMPLE_POOL_BLOCK_SIZE, sizeBytes);
             return nullptr;
         }
 
-        uint32_t offset = ((uint32_t)startBlock) << POOL_BLOCK_SHIFT;
+        uint32_t offset = ((uint32_t)startBlock) * SAMPLE_POOL_BLOCK_SIZE;
 
         e->data       = (int16_t*)(pool + offset);
         e->length     = lengthSamples;
@@ -332,9 +333,9 @@ private:
 
 
     inline void freeBlocks(uint32_t offset, uint32_t sizeBytes) {
-        uint32_t start = offset >> POOL_BLOCK_SHIFT;
+        uint32_t start = offset / SAMPLE_POOL_BLOCK_SIZE;
         uint32_t count =
-            (sizeBytes + (POOL_BLOCK_SIZE - 1)) >> POOL_BLOCK_SHIFT;
+            (sizeBytes + (SAMPLE_POOL_BLOCK_SIZE - 1u)) / SAMPLE_POOL_BLOCK_SIZE;
 
         for (uint32_t i = 0; i < count; i++)
             blockUsed[start + i] = 0;

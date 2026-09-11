@@ -31,6 +31,10 @@
 #define   CHANNEL_SAMPLE_BYTES  2     // can be 1, 2, 3 or 4 (2 and 4 only supported yet)
 #define   SAMPLE_RATE           44100
 
+// ===================== SAMPLE ASSET I/O / STORAGE ================================================================
+#define   SAMPLE_POOL_BLOCK_SIZE 4096u    // PSRAM allocation granularity; keep small to limit internal waste
+#define   SAMPLE_IO_CHUNK_SIZE   32768u   // SD read / DMA bounce-buffer size (64 sectors @ 512 B)
+
 // ===================== MIDI =======================================================================================
 #define   USE_USB_MIDI_DEVICE   1     // definition: the synth appears as a USB MIDI Device "S3 SF2 Synth"
 #define   USE_MIDI_STANDARD     2     // definition: the synth receives MIDI messages via serial 31250 bps

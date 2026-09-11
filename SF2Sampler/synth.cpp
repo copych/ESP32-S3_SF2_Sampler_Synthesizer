@@ -206,8 +206,8 @@ void Synth::noteOn(uint8_t ch, uint8_t note, uint8_t vel) {
     bool retrig = chan->monoMode != ChannelState::MonoLegato;
 
     auto zones = parser.getZonesForNote(note, vel, chan->getBank(), chan->program);
-    ESP_LOGI("NOTE", "ON ch=%u note=%u vel=%u bank=%u prog=%u zones=%u",
-             ch, note, vel, chan->getBank(), chan->program, (uint32_t)zones.size());
+ //   ESP_LOGI("NOTE", "ON ch=%u note=%u vel=%u bank=%u prog=%u zones=%u",
+  //           ch, note, vel, chan->getBank(), chan->program, (uint32_t)zones.size());
     if (zones.empty()) {
         ESP_LOGE("NOTE", "NO ZONES ch=%u note=%u bank=%u prog=%u",
                  ch, note, chan->getBank(), chan->program);
@@ -219,9 +219,11 @@ void Synth::noteOn(uint8_t ch, uint8_t note, uint8_t vel) {
     if (isMono) {
         if (retrig) {
             // Kill all existing voices on this channel
-            for (auto& v : voices)
-                if (v.active && v.channel == ch)
-                    v.die();
+            for (auto& v : voices) {
+                v.lockState();
+                if (v.active && v.channel == ch) v.die();
+                v.unlockState();
+            }
 
             // Start new voices for all zones
             for (auto& zone : zones) {
@@ -238,11 +240,14 @@ void Synth::noteOn(uint8_t ch, uint8_t note, uint8_t vel) {
 
                 Voice* v = allocateVoice(ch, note, score, zone.exclusiveClass); 
                 if (v) {
+                    v->lockState();
                     v->sampleHandle = h;
                     v->sampleID = zone.sampleID;
                     v->startNew(ch, note, vel, zone, chan);
+                    uint32_t started = v->active;
+                    v->unlockState();
                     ESP_LOGI("NOTE", "VOICE START ch=%u note=%u sid=%u voice=%p active=%u",
-                             ch, note, zone.sampleID, v, (unsigned)v->active);
+                             ch, note, zone.sampleID, v, (unsigned)started);
                 } else {
                     ESP_LOGE("NOTE", "VOICE ALLOC FAIL ch=%u note=%u sid=%u", ch, note, zone.sampleID);
                     samplePool.release(zone.sampleID);
@@ -252,7 +257,8 @@ void Synth::noteOn(uint8_t ch, uint8_t note, uint8_t vel) {
             // Legato: update pitch of ALL existing voices, or start new if none
             bool reused = false;
             for (Voice& v : voices) {
-                if (  v.active && v.channel == ch) {
+                v.lockState();
+                if (v.active && v.channel == ch) {
                     if (!v.noteHeld) {
                         v.die();
                     } else {
@@ -260,6 +266,7 @@ void Synth::noteOn(uint8_t ch, uint8_t note, uint8_t vel) {
                         reused = true;
                     }
                 }
+                v.unlockState();
             }
             if (!reused) {
                 // First note: start new voices
@@ -278,11 +285,14 @@ void Synth::noteOn(uint8_t ch, uint8_t note, uint8_t vel) {
                     float score = vel * DIV_127;
                     Voice* v = allocateVoice(ch, note, score, zone.exclusiveClass);
                     if (v) {
+                        v->lockState();
                         v->sampleHandle = h;
                         v->sampleID = zone.sampleID;
                         v->startNew(ch, note, vel, zone, chan);
+                        uint32_t started = v->active;
+                        v->unlockState();
                         ESP_LOGI("NOTE", "VOICE START ch=%u note=%u sid=%u voice=%p active=%u",
-                                 ch, note, zone.sampleID, v, (unsigned)v->active);
+                                 ch, note, zone.sampleID, v, (unsigned)started);
                     } else {
                         ESP_LOGE("NOTE", "VOICE ALLOC FAIL ch=%u note=%u sid=%u", ch, note, zone.sampleID);
                         samplePool.release(zone.sampleID);
@@ -301,18 +311,21 @@ void Synth::noteOn(uint8_t ch, uint8_t note, uint8_t vel) {
                          ch, note, zone.sampleID);
                 continue;
             }
-            ESP_LOGI("NOTE", "ACQUIRE OK ch=%u note=%u sid=%u ptr=%p len=%u rate=%u",
-                     ch, note, zone.sampleID, h->data, h->length, h->sampleRate);
+    //        ESP_LOGI("NOTE", "ACQUIRE OK ch=%u note=%u sid=%u ptr=%p len=%u rate=%u",
+    //                 ch, note, zone.sampleID, h->data, h->length, h->sampleRate);
 
             float score = vel * DIV_127;
             Voice* v = allocateVoice(ch, note, score, zone.exclusiveClass);
 
             if (v) {
+                v->lockState();
                 v->sampleHandle = h;
                 v->sampleID = zone.sampleID;
                 v->startNew(ch, note, vel, zone, chan);
-                ESP_LOGI("NOTE", "VOICE START ch=%u note=%u sid=%u voice=%p active=%u",
-                         ch, note, zone.sampleID, v, (unsigned)v->active);
+                uint32_t started = v->active;
+                v->unlockState();
+    //            ESP_LOGI("NOTE", "VOICE START ch=%u note=%u sid=%u voice=%p active=%u",
+    //                     ch, note, zone.sampleID, v, (unsigned)started);
             } else {
                 ESP_LOGE("NOTE", "VOICE ALLOC FAIL ch=%u note=%u sid=%u", ch, note, zone.sampleID);
                 samplePool.release(zone.sampleID);
@@ -337,31 +350,26 @@ void Synth::noteOff(uint8_t ch, uint8_t note) {
     uint8_t nextNote = chan->topNote();
 
     for (Voice& v : voices) {
-        if (!v.active || v.channel != ch) continue;
-
-        if (isMono) {
-            if (!chan->hasNotes()) {
-                // No more held notes → kill all
-                v.noteHeld = false;
-                v.stop();
-            } else if (isRetrig) {
-                if (v.note == note) {
+        v.lockState();
+        if (v.active && v.channel == ch) {
+            if (isMono) {
+                if (!chan->hasNotes()) {
                     v.noteHeld = false;
-                    v.die();
-                }
-            } else {
-                // MonoLegato: switch pitch of ALL voices to next note
-                if (v.note != nextNote) {
+                    v.stop();
+                } else if (isRetrig) {
+                    if (v.note == note) {
+                        v.noteHeld = false;
+                        v.die();
+                    }
+                } else if (v.note != nextNote) {
                     v.updatePitchOnly(nextNote, chan);
                 }
-            }
-        } else {
-            // Poly mode
-            if (v.note == note) {
+            } else if (v.note == note) {
                 v.noteHeld = false;
                 v.stop();
             }
         }
+        v.unlockState();
     }
 }
 
@@ -372,7 +380,11 @@ Voice*  __attribute__((always_inline))   Synth::allocateVoice(uint8_t ch, uint8_
 
     // A returned slot may still own the previous voice's sample.
     // Reuse is immediate, so release it before assigning a new handle.
-    if (v && v->active) v->kill();
+    if (v) {
+        v->lockState();
+        if (v->active) v->kill();
+        v->unlockState();
+    }
     return v;
 }
  
@@ -426,9 +438,9 @@ void Synth::controlChange(uint8_t ch, uint8_t ctrl, uint8_t val) {
         case 10: // Pan
             state.pan = fval;
             for (Voice& v : voices) {
-                if ( v.channel == ch) {
-                    v.updatePan(); 
-                }
+                v.lockState();
+                if (v.channel == ch) v.updatePan();
+                v.unlockState();
             }
             break;
         case 64: // Sustain Pedal
@@ -438,9 +450,9 @@ void Synth::controlChange(uint8_t ch, uint8_t ctrl, uint8_t val) {
                 if (!sustainOn) {
                     // Release all sustained voices on this channel
                     for (Voice& v : voices) {
-                        if (v.active && v.channel == ch && !v.noteHeld) {
-                            v.stop(); 
-                        }
+                        v.lockState();
+                        if (v.active && v.channel == ch && !v.noteHeld) v.stop();
+                        v.unlockState();
                     }
                 }
             }
@@ -645,7 +657,7 @@ void Synth::programChange(uint8_t ch, uint8_t program) {
                 break;
             }
 
-            ESP_LOGI("PC", "KEEP sid=%u ptr=%p len=%u", sample->sampleID, h->data, h->length);
+    //        ESP_LOGI("PC", "KEEP sid=%u ptr=%p len=%u", sample->sampleID, h->data, h->length);
             sample->data = h->data;
             state.loadedSamples.push_back(sample);
             reused++;
@@ -656,7 +668,7 @@ void Synth::programChange(uint8_t ch, uint8_t program) {
         SampleHandle* h = samplePool.get(sid);
 
         if (!h) {
-            ESP_LOGI("PC", "LOAD sid=%u", sid);
+    //        ESP_LOGI("PC", "LOAD sid=%u", sid);
             h = parser.readSampleIntoPool(sid);
             if (!h) {
                 ESP_LOGE("PC", "LOAD FAIL sid=%u", sid);
@@ -665,7 +677,7 @@ void Synth::programChange(uint8_t ch, uint8_t program) {
             }
             loaded++;
         } else {
-            ESP_LOGI("PC", "FOUND sid=%u ptr=%p len=%u", sid, h->data, h->length);
+     //       ESP_LOGI("PC", "FOUND sid=%u ptr=%p len=%u", sid, h->data, h->length);
             reused++;
         }
 
@@ -675,7 +687,7 @@ void Synth::programChange(uint8_t ch, uint8_t program) {
             incrementalOk = false;
             break;
         }
-        ESP_LOGI("PC", "PIN OK sid=%u ptr=%p len=%u", sid, h->data, h->length);
+    //    ESP_LOGI("PC", "PIN OK sid=%u ptr=%p len=%u", sid, h->data, h->length);
 
         sample->data = h->data;
         if (sample->refCount < UINT8_MAX) sample->refCount++;
@@ -800,6 +812,14 @@ void   __attribute__((hot,always_inline)) IRAM_ATTR Synth::renderLRBlock(float* 
         Voice& voice = voices[v];
         if (!voice.active) continue;
 
+        // Core0 owns this Voice for the whole per-voice audio block. Core1
+        // lifetime/restart mutations take the same lock, so nextSample() never sees partial state.
+        if (__builtin_expect(!voice.tryLockState(), 0)) continue;
+        if (__builtin_expect(!voice.active || !voice.sampleHandle || !voice.data, 0)) {
+            voice.unlockState();
+            continue;
+        }
+
         float volL = volume_scaler * (*voice.modVolume) * (*voice.modExpression) * voice.velocityVolume * voice.panL;
         float volR = volume_scaler * (*voice.modVolume) * (*voice.modExpression) * voice.velocityVolume * voice.panR;
 
@@ -868,6 +888,8 @@ void   __attribute__((hot,always_inline)) IRAM_ATTR Synth::renderLRBlock(float* 
             delRp[i] += rDel * dAmt;
 #endif
         }
+
+        voice.unlockState();
     }
 
 #ifdef ENABLE_CH_FILTER
@@ -920,10 +942,9 @@ Voice* Synth::findWeakestVoiceOnNote(uint8_t ch, uint8_t note, float newScore, u
 
     for (int i = 0; i < MAX_VOICES; ++i) {
         Voice& v = voices[i];
-        if (v.active && v.channel == ch) { 
-            if (v.exclusiveClass > 0 && v.exclusiveClass == exclusiveClass) {
-                v.die(); // Kill voices of the same class
-            }
+        v.lockState();
+        if (v.active && v.channel == ch) {
+            if (v.exclusiveClass > 0 && v.exclusiveClass == exclusiveClass) v.die();
             if (v.note == note) {
                 count++;
                 v.updateScore();
@@ -933,11 +954,10 @@ Voice* Synth::findWeakestVoiceOnNote(uint8_t ch, uint8_t note, float newScore, u
                 }
             }
         }
+        v.unlockState();
     }
 
-    if (count >= MAX_VOICES_PER_NOTE && weakest)// && weakestScore < newScore)
-        return weakest;
-
+    if (count >= MAX_VOICES_PER_NOTE && weakest) return weakest;
     return nullptr;
 }
 
@@ -946,12 +966,17 @@ Voice* Synth::findWorstVoice() {
     float minScore = FLT_MAX;
 
     for (int i = 0; i < MAX_VOICES; ++i) {
-        voices[i].updateScore();
-        if (!voices[i].active || !voices[i].isRunning()) return &voices[i];
+        Voice& v = voices[i];
+        v.lockState();
+        v.updateScore();
+        bool available = !v.active || !v.isRunning();
+        float score = v.score;
+        v.unlockState();
 
-        if (voices[i].score < minScore) {
-            minScore = voices[i].score;
-            worst = &voices[i];
+        if (available) return &v;
+        if (score < minScore) {
+            minScore = score;
+            worst = &v;
         }
     }
 
@@ -969,7 +994,11 @@ void Synth::updateScores() {
 
 void Synth::reset() {
     // Release voice ownership before touching channel state.
-    for (Voice& v : voices) v.kill();
+    for (Voice& v : voices) {
+        v.lockState();
+        v.kill();
+        v.unlockState();
+    }
 
     // Release one pool reference for every channel-owned sample.
     for (int ch = 0; ch < 16; ++ch) {
@@ -987,15 +1016,16 @@ void Synth::reset() {
 void Synth::soundOff(uint8_t ch) {
     if (ch >= 16) return;
     for (Voice& v : voices) {
-        if (v.active && v.channel == ch) {
-            v.kill();
-        }
+        v.lockState();
+        if (v.active && v.channel == ch) v.kill();
+        v.unlockState();
     }
 }
 
 void Synth::allNotesOff(uint8_t ch) {
     if (ch >= 16) return;
     for (Voice& v : voices) {
+        v.lockState();
         if (v.active && v.channel == ch) {
             if (*v.modSustain) {
                // v.sustainHeld = true; // wait until pedal release
@@ -1003,6 +1033,7 @@ void Synth::allNotesOff(uint8_t ch) {
                 v.stop();
             }
         }
+        v.unlockState();
     }
 }
 

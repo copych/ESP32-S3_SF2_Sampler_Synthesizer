@@ -298,7 +298,11 @@ void setup() {
     //btStop(); 
     
 
-g_sd_dma_buf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_DMA);
+g_sd_dma_buf = (uint8_t*)heap_caps_malloc(SAMPLE_IO_CHUNK_SIZE, MALLOC_CAP_DMA);
+if (!g_sd_dma_buf) {
+    ESP_LOGE(TAG, "SD DMA buffer allocation failed (%u bytes)", (unsigned)SAMPLE_IO_CHUNK_SIZE);
+    while (true) vTaskDelay(1000);
+}
 
 #if MIDI_IN_DEV == USE_USB_MIDI_DEVICE
   // Change USB Device Descriptor Parameter

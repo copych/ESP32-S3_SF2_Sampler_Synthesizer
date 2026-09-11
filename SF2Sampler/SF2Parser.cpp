@@ -564,47 +564,39 @@ SampleHandle* SF2Parser::readSampleIntoPool(uint32_t sid) {
         return nullptr;
     }
 
+    // parse() keeps the SF2 open for its entire active lifetime. Reopening here
+    // is only a recovery path; normal preset changes must not pay FAT open cost.
     if (!file) {
         file = filesystem->open(filepath, "r");
         if (!file) {
-            ESP_LOGE("POOL", "file open failed");
+            ESP_LOGE("POOL", "file reopen failed");
             return nullptr;
         }
     }
 
     auto& s = samples[sid];
 
-    uint32_t length = (s.end > s.start) ? (s.end - s.start) : 0;
-    uint32_t bytes  = length << 1;
+    const uint32_t length = (s.end > s.start) ? (s.end - s.start) : 0;
+    const uint32_t bytes  = length << 1;
 
     if (bytes == 0) {
         ESP_LOGW("POOL", "empty sample sid=%u", sid);
         return nullptr;
     }
 
-    uint32_t pos = smplStart + (s.start << 1);
+    const uint32_t pos = smplStart + (s.start << 1);
 
-    //ESP_LOGI("POOL",
-      //  "sid=%u start=%u end=%u len=%u bytes=%u",
-        //sid, s.start, s.end, length, bytes);
-
-    //ESP_LOGI("POOL",
-      //  "seekPos=%u endPos=%u fileSize=%u",
-        //pos, pos + bytes, file.size());
-
-    if (!file.seek(pos)) {
-        ESP_LOGE("POOL", "seek failed sid=%u", sid);
+    // Samples are loaded in physical-offset order by Synth. Avoid even the
+    // high-level seek when the previous read already left us at this sample.
+    if (file.position() != pos && !file.seek(pos, SeekSet)) {
+        ESP_LOGE("POOL", "seek failed sid=%u pos=%u", sid, pos);
         return nullptr;
     }
 
-    // --- allocate directly in pool ---
     SampleHandle* h = samplePool.insertEmpty(
-        sid,
-        length,
-        s.startLoop - s.start,
-        s.endLoop   - s.start,
-        s.sampleRate,
-        s.originalPitch
+        sid, length,
+        s.startLoop - s.start, s.endLoop - s.start,
+        s.sampleRate, s.originalPitch
     );
 
     if (!h) {
@@ -612,49 +604,30 @@ SampleHandle* SF2Parser::readSampleIntoPool(uint32_t sid) {
         return nullptr;
     }
 
-    ESP_LOGI("POOL", "ALLOC sid=%u len=%u bytes=%u ptr=%p loop=%u..%u rate=%u root=%d",
-             sid, length, bytes, h->data, h->loopStart, h->loopEnd, h->sampleRate, h->rootKey);
-
     uint8_t* dst = (uint8_t*)h->data;
-
     uint32_t remaining = bytes;
 
-    static const uint32_t DMA_CHUNK = 1024; // IMPORTANT
-
-
-
-
     while (remaining) {
-        uint32_t chunk = (remaining > DMA_CHUNK) ? DMA_CHUNK : remaining;
+        const uint32_t chunk = (remaining > SAMPLE_IO_CHUNK_SIZE)
+                             ? SAMPLE_IO_CHUNK_SIZE : remaining;
 
-        // Only align if we are NOT on the last chunk
-        if (remaining > chunk) {
-            chunk &= ~31;
-            if (chunk == 0) chunk = 32;
-        }
-
-        size_t r = 0;
-
-        for (int retry = 0; retry < 3; ++retry) {
-            r = file.read(g_sd_dma_buf, chunk);
-            if (r == chunk) break;
-        }
-
-        if (r != chunk) {
-            ESP_LOGE("POOL", "read failed sid=%u (%u/%u)", sid, (unsigned)r, chunk);
-            samplePool.discard(sid);
-            return nullptr;
+        uint32_t got = 0;
+        while (got < chunk) {
+            const size_t r = file.read(g_sd_dma_buf + got, chunk - got);
+            if (r == 0) {
+                ESP_LOGE("POOL", "read failed sid=%u pos=%u got=%u/%u",
+                         sid, (unsigned)file.position(), got, chunk);
+                samplePool.discard(sid);
+                return nullptr;
+            }
+            got += (uint32_t)r;
         }
 
         memcpy(dst, g_sd_dma_buf, chunk);
-
         dst += chunk;
         remaining -= chunk;
     }
 
-    ESP_LOGI("POOL", "READ OK sid=%u", sid);
-
-    ESP_LOGI("POOL", "READ OK sid=%u bytes=%u ptr=%p", sid, bytes, h->data);
     return h;
 }
 
@@ -859,6 +832,8 @@ void SF2Parser::dumpPresetStructure() {
 }
 
 void SF2Parser::clear() {
+    if (file) file.close();
+
     for (auto& sample : samples) {
         if (sample.data) { 
             sample.data = nullptr;
@@ -948,13 +923,7 @@ void SF2Parser::dumpInstrumentSizes() {
 
         float mb = totalBytes / (1024.0f * 1024.0f);
 
-        ESP_LOGI("SF2",
-            "Bank=%u Program=%u | Samples=%u | Size=%.2f MB",
-            preset.bank,
-            preset.program,
-            unique,
-            mb
-        );
+      //  ESP_LOGI("SF2", "Bank=%u Program=%u | Samples=%u | Size=%.2f MB", preset.bank, preset.program, unique, mb );
     }
 
     ESP_LOGI("SF2", "=== END ===");
