@@ -1,3 +1,6 @@
+THIS BRANCH IS EXPERIMENTAL.
+THE IDEA IS TO USE LESS RAM, ONLY PRE-LOADING THE REQUIRED SAMPLES ON PROGRAM CHANGE
+
 # ESP32 SoundFont (SF2) Sampler Synthesizer
 
 An SF2 (SoundFont 2) based wavetable synth designed specifically for the ESP32-S3 / ESP32-P4 microcontrollers. This project leverages the enhanced memory capabilities of the PSRAM equipped MCUs to efficiently load and play SoundFont samples, providing a compact and powerful sampler solution. It's cheap and simple, yet powerful.
